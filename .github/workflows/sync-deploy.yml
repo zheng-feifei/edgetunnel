@@ -124,6 +124,20 @@ jobs:
             echo "绑定来源：仓库变量 KV_NAMESPACE_ID（wrangler.ci.toml 里还没填有效 id，现场生成配置）"
             cp wrangler.toml .wrangler-ci.toml
             grep -q '^keep_vars' .wrangler-ci.toml || printf '\nkeep_vars = true\n' >> .wrangler-ci.toml
+            # 关掉 workers.dev：wrangler 在「没有 routes」时默认把它打开，自定义域不算 routes。
+            # 必须写在 [[kv_namespaces]] 之前 —— TOML 里表头之后的所有裸键都属于那张表，
+            # 写到后面会变成 kv_namespaces.workers_dev 而报「unexpected field」。
+            if grep -q '^[[:space:]]*workers_dev' .wrangler-ci.toml; then
+              sed -i 's/^[[:space:]]*workers_dev.*/workers_dev = false/' .wrangler-ci.toml
+            else
+              printf '\nworkers_dev = false\n' >> .wrangler-ci.toml
+            fi
+            if grep -q '^[[:space:]]*preview_urls' .wrangler-ci.toml; then
+              sed -i 's/^[[:space:]]*preview_urls.*/preview_urls = false/' .wrangler-ci.toml
+            else
+              printf '\npreview_urls = false\n' >> .wrangler-ci.toml
+            fi
+            # KV 表必须放在最后
             printf '\n[[kv_namespaces]]\nbinding = "KV"\nid = "%s"\n' "$KV_ID" >> .wrangler-ci.toml
             CFG=.wrangler-ci.toml
           else
@@ -139,6 +153,21 @@ jobs:
             npx --yes wrangler@4 deploy --config "$CFG" --name "$WORKER_NAME" --compatibility-date "$COMPAT"
           else
             npx --yes wrangler@4 deploy --config "$CFG" --name "$WORKER_NAME"
+          fi
+
+          # ---- 兜底：强制关闭 workers.dev（生产 + 预览）----
+          # 即使配置里写了 workers_dev = false，也再用 API 确认一次，
+          # 因为这个开关曾经在每次部署后被重新打开过。
+          RES="$(curl -s -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/subdomain" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"enabled":false,"previews_enabled":false}')"
+          echo "$RES"
+          if echo "$RES" | grep -q '"enabled"[[:space:]]*:[[:space:]]*false'; then
+            echo "workers.dev 已关闭（生产 ${WORKER_NAME}.<子域>.workers.dev + 预览域名）"
+          else
+            echo "::warning::workers.dev 关闭请求未确认，请到面板 设置 → 域和路由 检查"
           fi
 
       - name: Skipped deploy (no token configured)
