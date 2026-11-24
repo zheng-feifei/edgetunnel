@@ -20,9 +20,11 @@ concurrency:
 env:
   UPSTREAM_REPO: cmliu/edgetunnel
   UPSTREAM_BRANCH: main
-  # 下面三个用「仓库变量」(Settings > Secrets and variables > Actions > Variables) 覆盖，不填则用默认值
+  # 下面几个用「仓库变量」(Settings > Secrets and variables > Actions > Variables) 覆盖，不填则用默认值
   PAGES_PROJECT: ${{ vars.PAGES_PROJECT_NAME || 'edgetunnel' }}
   WORKER_NAME: ${{ vars.WORKER_NAME || 'edgetunnel' }}
+  # KV_ID 只是兜底：优先用仓库根目录 wrangler.ci.toml 里固定写好的 id
+  KV_ID: ${{ vars.KV_NAMESPACE_ID }}
   DEPLOY_TARGET: ${{ vars.DEPLOY_TARGET || 'pages' }}   # pages / workers / none
   CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
   CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -81,7 +83,9 @@ jobs:
         if: steps.sync.outputs.deploy == 'true'
         run: |
           mkdir -p .upload
-          rsync -a --exclude '.git' --exclude '.github' --exclude '.upload' --exclude 'node_modules' ./ .upload/
+          # 排除 CI 配置文件，避免它被当成静态资源上传后被公开访问
+          rsync -a --exclude '.git' --exclude '.github' --exclude '.upload' --exclude 'node_modules' \
+                --exclude 'wrangler.ci.toml' ./ .upload/
           echo "----- 待上传内容 -----"
           ls -lh .upload
 
@@ -99,13 +103,43 @@ jobs:
             --commit-dirty=true
 
       # ---------- 4. 部署到 Cloudflare Workers（可选，需把 DEPLOY_TARGET 设为 workers）----------
+      # 绑定来源优先级：仓库里的 wrangler.ci.toml > 仓库变量 KV_NAMESPACE_ID > 报错中止
       - name: Deploy to Cloudflare Workers
         if: steps.sync.outputs.deploy == 'true' && env.CF_TOKEN != '' && env.DEPLOY_TARGET == 'workers'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          npx --yes wrangler@4 deploy --name "$WORKER_NAME"
+          set -euo pipefail
+
+          # 兼容日期跟随上游 wrangler.toml，避免 wrangler.ci.toml 里的值越用越旧
+          COMPAT="$(grep -oE 'compatibility_date[[:space:]]*=[[:space:]]*"[^"]+"' wrangler.toml 2>/dev/null \
+                    | head -1 | sed -E 's/.*"([^"]+)"/\1/' || true)"
+
+          # 判断 wrangler.ci.toml 里是否已经填了真正的 KV id（32 位十六进制）
+          if [ -f wrangler.ci.toml ] && grep -qE '^[[:space:]]*id[[:space:]]*=[[:space:]]*"[0-9a-fA-F]{32}"' wrangler.ci.toml; then
+            echo "绑定来源：仓库内 wrangler.ci.toml（KV 已固定，同步上游不会影响）"
+            CFG=wrangler.ci.toml
+          elif [ -n "${KV_ID}" ]; then
+            echo "绑定来源：仓库变量 KV_NAMESPACE_ID（wrangler.ci.toml 里还没填有效 id，现场生成配置）"
+            cp wrangler.toml .wrangler-ci.toml
+            grep -q '^keep_vars' .wrangler-ci.toml || printf '\nkeep_vars = true\n' >> .wrangler-ci.toml
+            printf '\n[[kv_namespaces]]\nbinding = "KV"\nid = "%s"\n' "$KV_ID" >> .wrangler-ci.toml
+            CFG=.wrangler-ci.toml
+          else
+            echo "::error::找不到有效的 KV 绑定配置。edgetunnel 的后台和订阅依赖 KV，而 wrangler deploy 会用配置里的绑定集【整体替换】线上绑定——不声明 KV 就会把线上已有的绑定删掉。请二选一：① 在仓库根目录的 wrangler.ci.toml 里填好 id（推荐，一次填永久生效）；② 在 Settings → Secrets and variables → Actions → Variables 添加 KV_NAMESPACE_ID。"
+            exit 1
+          fi
+
+          echo "----- 本次生效的部署配置 -----"
+          cat "$CFG"
+          echo "----- 目标 Worker 名称: $WORKER_NAME -----"
+          if [ -n "$COMPAT" ]; then
+            echo "----- 兼容日期（跟随上游）: $COMPAT -----"
+            npx --yes wrangler@4 deploy --config "$CFG" --name "$WORKER_NAME" --compatibility-date "$COMPAT"
+          else
+            npx --yes wrangler@4 deploy --config "$CFG" --name "$WORKER_NAME"
+          fi
 
       - name: Skipped deploy (no token configured)
         if: steps.sync.outputs.deploy == 'true' && env.CF_TOKEN == ''
